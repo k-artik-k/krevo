@@ -1,74 +1,53 @@
-import { useRef, useState } from "react";
-import { adminApi } from "../api";
+import { useState } from "react";
 import { mediaUrl } from "../types";
-import { useAdmin } from "./ctx";
 
-/** Upload / replace / remove one image. `onChange(newKey, oldKey)` lets the parent delete the old file after saving. */
-export default function MediaField({ label, value, onChange, hint }: { label: string; value: string | null; onChange: (key: string | null, old: string | null) => void; hint?: string }) {
-  const { run } = useAdmin();
-  const input = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState(false);
-  const pick = async (file?: File) => {
-    if (!file) return;
-    setBusy(true);
-    const r = await run(() => adminApi.upload(file));
-    setBusy(false);
-    if (r) onChange(r.key, value);
-    if (input.current) input.current.value = "";
-  };
+/** Text input for an image filename (from public/media/) or full URL, with live preview. */
+export default function MediaField({ label, value, onChange, hint }: { label: string; value: string | null; onChange: (key: string | null) => void; hint?: string }) {
   return (
     <div className="field">
       <span className="label" id={`l-${label}`}>{label}</span>
       <div className="media-field" role="group" aria-labelledby={`l-${label}`}>
         <div className="media-preview">{value ? <img src={mediaUrl(value)} alt={`${label} preview`} /> : <span>No image</span>}</div>
-        <div className="row">
-          <button type="button" className="btn sm" disabled={busy} onClick={() => input.current?.click()}>{busy ? "Uploading…" : value ? "Replace" : "Upload"}</button>
-          {value && <button type="button" className="btn sm danger" disabled={busy} onClick={() => onChange(null, value)}>Remove</button>}
-        </div>
-        <input ref={input} type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/x-icon" hidden tabIndex={-1} onChange={(e) => pick(e.target.files?.[0])} />
+        <input
+          type="text"
+          value={value ?? ""}
+          onChange={(e) => onChange(e.target.value || null)}
+          placeholder="e.g. cover.png or https://…"
+        />
+        {value && <button type="button" className="btn sm danger" onClick={() => onChange(null)}>Remove</button>}
       </div>
       {hint && <span className="hint">{hint}</span>}
     </div>
   );
 }
 
-export function GalleryField({ value, onChange }: { value: string[]; onChange: (keys: string[], removed?: string) => void }) {
-  const { run } = useAdmin();
-  const input = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState(false);
-  const add = async (files: FileList | null) => {
-    if (!files?.length) return;
-    setBusy(true);
-    const keys: string[] = [];
-    for (const f of [...files].slice(0, 20 - value.length)) {
-      const r = await run(() => adminApi.upload(f));
-      if (r) keys.push(r.key);
-    }
-    setBusy(false);
-    if (keys.length) onChange([...value, ...keys]);
-    if (input.current) input.current.value = "";
-  };
+export function GalleryField({ value, onChange }: { value: string[]; onChange: (keys: string[]) => void }) {
+  const [input, setInput] = useState("");
   const move = (i: number, d: number) => { const n = [...value]; [n[i], n[i + d]] = [n[i + d], n[i]]; onChange(n); };
+  const add = () => {
+    const v = input.trim();
+    if (v && value.length < 20) { onChange([...value, v]); setInput(""); }
+  };
   return (
     <div className="field">
       <span className="label" id="l-gallery">Screenshot gallery</span>
       <ul className="gallery-list" aria-labelledby="l-gallery">
         {value.map((k, i) => (
-          <li key={k}>
+          <li key={k + i}>
             <img src={mediaUrl(k)} alt={`Screenshot ${i + 1}`} />
             <div className="row">
               <button type="button" className="btn sm" disabled={i === 0} onClick={() => move(i, -1)} aria-label={`Move screenshot ${i + 1} earlier`}>↑</button>
               <button type="button" className="btn sm" disabled={i === value.length - 1} onClick={() => move(i, 1)} aria-label={`Move screenshot ${i + 1} later`}>↓</button>
-              <button type="button" className="btn sm danger" onClick={() => onChange(value.filter((x) => x !== k), k)} aria-label={`Remove screenshot ${i + 1}`}>Remove</button>
+              <button type="button" className="btn sm danger" onClick={() => onChange(value.filter((_, j) => j !== i))} aria-label={`Remove screenshot ${i + 1}`}>Remove</button>
             </div>
           </li>
         ))}
       </ul>
       <div className="row">
-        <button type="button" className="btn sm" disabled={busy || value.length >= 20} onClick={() => input.current?.click()}>{busy ? "Uploading…" : "Add screenshots"}</button>
-        <span className="hint">PNG, JPEG, WebP or GIF, up to 5 MB each.</span>
+        <input type="text" value={input} onChange={(e) => setInput(e.target.value)} placeholder="e.g. screenshot1.png" onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} />
+        <button type="button" className="btn sm" disabled={!input.trim() || value.length >= 20} onClick={add}>Add screenshot</button>
       </div>
-      <input ref={input} type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" hidden tabIndex={-1} onChange={(e) => add(e.target.files)} />
+      <span className="hint">Filename from public/media/ folder, or a full URL. Images must be committed and deployed.</span>
     </div>
   );
 }

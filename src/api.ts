@@ -1,4 +1,4 @@
-import type { AdminProject, MediaItem, Project, SiteSettings } from "./types";
+import type { AdminProject, Project, SiteSettings } from "./types";
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -42,7 +42,4 @@ export const adminApi = {
   reorder: (ids: string[]) => request<{ ok: true }>("PUT", `${A}/projects/order`, { ids }),
   settings: () => request<{ settings: SiteSettings }>("GET", `${A}/settings`),
   saveSettings: (s: SiteSettings) => request<{ settings: SiteSettings }>("PUT", `${A}/settings`, s),
-  media: () => request<{ media: MediaItem[] }>("GET", `${A}/media`),
-  upload: (file: File) => { const f = new FormData(); f.append("file", file); return request<{ key: string }>("POST", `${A}/media`, f); },
-  deleteMedia: (key: string, force = false) => request<{ ok: true }>("DELETE", `${A}/media/${key}${force ? "?force=1" : ""}`),
 };

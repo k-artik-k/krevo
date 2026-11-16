@@ -1,0 +1,1439 @@
+﻿
+
+========== worker\index.ts ==========
+import { assertCsrf, assertSameOrigin, getSession, login, logout, Session } from "./auth";
+import { DEFAULT_SETTINGS, projectInput, Settings, settingsInput } from "./validate";
+import { Env, HttpError, json, readJson, slugify } from "./util";
+
+interface ProjectRow {
+  id: string; slug: string; title: string; year: number; category: string;
+  short_description: string; full_description: string; technologies: string;
+  github_url: string | null; live_url: string | null; video_url: string | null;
+  cover_key: string | null; gallery: string; status: "draft" | "published";
+  position: number; created_at: number; updated_at: number;
+}
+
+const parseList = (s: string): string[] => { try { const v = JSON.parse(s); return Array.isArray(v) ? v : []; } catch { return []; } };
+
+const publicProject = (r: ProjectRow) => ({
+  id: r.id, slug: r.slug, title: r.title, year: r.year, category: r.category,
+  shortDescription: r.short_description, fullDescription: r.full_description,
+  technologies: parseList(r.technologies), githubUrl: r.github_url, liveUrl: r.live_url,
+  videoUrl: r.video_url, coverKey: r.cover_key, gallery: parseList(r.gallery),
+});
+const adminProject = (r: ProjectRow) => ({ ...publicProject(r), status: r.status, position: r.position, createdAt: r.created_at, updatedAt: r.updated_at });
+
+async function loadSettings(env: Env): Promise<Settings> {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'site'").first<{ value: string }>();
+  let saved: Record<string, unknown> = {};
+  try { saved = row ? JSON.parse(row.value) : {}; } catch { /* ignore corrupt row */ }
+  return { ...DEFAULT_SETTINGS, ...saved } as Settings;
+}
+
+async function uniqueSlug(env: Env, title: string): Promise<string> {
+  const base = slugify(title) || "project";
+  for (let i = 1; i < 50; i++) {
+    const slug = i === 1 ? base : `${base}-${i}`;
+    if (!(await env.DB.prepare("SELECT 1 FROM projects WHERE slug = ?").bind(slug).first())) return slug;
+  }
+  return `${base}-${crypto.randomUUID().slice(0, 6)}`;
+}
+
+const get = (env: Env, id: string) => env.DB.prepare("SELECT * FROM projects WHERE id = ?").bind(id).first<ProjectRow>();
+
+const insertSql = `INSERT INTO projects (id, slug, title, year, category, short_description, full_description, technologies,
+  github_url, live_url, video_url, cover_key, gallery, status, position, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+// ---------- media ----------
+const MAX_UPLOAD = 5 * 1024 * 1024;
+function sniff(b: Uint8Array): { mime: string; ext: string } | null {
+  const is = (...bytes: number[]) => bytes.every((v, i) => b[i] === v);
+  if (is(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return { mime: "image/png", ext: "png" };
+  if (is(0xff, 0xd8, 0xff)) return { mime: "image/jpeg", ext: "jpg" };
+  if (is(0x47, 0x49, 0x46, 0x38) && (b[4] === 0x37 || b[4] === 0x39) && b[5] === 0x61) return { mime: "image/gif", ext: "gif" };
+  if (is(0x52, 0x49, 0x46, 0x46) && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return { mime: "image/webp", ext: "webp" };
+  if (is(0x00, 0x00, 0x01, 0x00)) return { mime: "image/x-icon", ext: "ico" };
+  return null;
+}
+
+async function serveMedia(req: Request, env: Env, key: string): Promise<Response> {
+  if (!/^[0-9a-f-]{36}\.(png|jpg|webp|gif|ico)$/.test(key)) throw new HttpError(404, "Not found");
+  const headers = {
+    etag: `"${key}"`, "cache-control": "public, max-age=31536000, immutable",
+    "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; sandbox",
+  };
+  if (req.headers.get("if-none-match") === headers.etag) return new Response(null, { status: 304, headers });
+  const obj = await env.MEDIA.get(key);
+  if (!obj) throw new HttpError(404, "Not found");
+  return new Response(obj.body, { headers: { ...headers, "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream" } });
+}
+
+async function mediaInUse(env: Env, key: string, exceptProject?: string): Promise<boolean> {
+  const p = await env.DB.prepare("SELECT 1 FROM projects WHERE (cover_key = ?1 OR gallery LIKE '%' || ?1 || '%') AND id IS NOT ?2 LIMIT 1").bind(key, exceptProject ?? null).first();
+  if (p) return true;
+  const s = await env.DB.prepare("SELECT 1 FROM settings WHERE value LIKE '%' || ? || '%' LIMIT 1").bind(key).first();
+  return !!s;
+}
+
+async function deleteMedia(env: Env, key: string, force: boolean): Promise<void> {
+  if (await mediaInUse(env, key)) {
+    if (!force) throw new HttpError(409, "Image is still used by a project or setting");
+    await env.DB.prepare("UPDATE projects SET cover_key = NULL WHERE cover_key = ?").bind(key).run();
+    const rows = await env.DB.prepare("SELECT id, gallery FROM projects WHERE gallery LIKE '%' || ? || '%'").bind(key).all<{ id: string; gallery: string }>();
+    await env.DB.batch(rows.results.map((r) => env.DB.prepare("UPDATE projects SET gallery = ? WHERE id = ?").bind(JSON.stringify(parseList(r.gallery).filter((k) => k !== key)), r.id)));
+    const s = await loadSettings(env);
+    if (s.logoKey === key) s.logoKey = null;
+    if (s.faviconKey === key) s.faviconKey = null;
+    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('site', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(JSON.stringify(s)).run();
+  }
+  await env.MEDIA.delete(key);
+  await env.DB.prepare("DELETE FROM media WHERE key = ?").bind(key).run();
+}
+
+// ---------- routing ----------
+async function admin(req: Request, env: Env, path: string): Promise<Response> {
+  const method = req.method;
+  const mutating = method !== "GET" && method !== "HEAD";
+  if (mutating) assertSameOrigin(req);
+
+  if (path === "/login" && method === "POST") {
+    const body = await readJson(req, 2000);
+    if (typeof body.password !== "string" || !body.password || body.password.length > 200) throw new HttpError(400, "Password required");
+    const { csrf, setCookie } = await login(req, env, body.password);
+    return json({ authenticated: true, csrf }, 200, { "set-cookie": setCookie });
+  }
+
+  const session: Session | null = await getSession(req, env);
+  if (path === "/logout" && method === "POST") {
+    return json({ ok: true }, 200, { "set-cookie": await logout(req, env, session) });
+  }
+  if (!session) throw new HttpError(401, "Not signed in");
+  if (mutating) assertCsrf(req, session);
+
+  if (path === "/session" && method === "GET") return json({ authenticated: true, csrf: session.csrf });
+
+  if (path === "/projects" && method === "GET") {
+    const rows = await env.DB.prepare("SELECT * FROM projects ORDER BY position ASC, created_at ASC").all<ProjectRow>();
+    return json({ projects: rows.results.map(adminProject) });
+  }
+  if (path === "/projects" && method === "POST") {
+    const p = projectInput(await readJson(req));
+    const id = crypto.randomUUID(), now = Date.now();
+    const slug = await uniqueSlug(env, p.title);
+    const pos = (await env.DB.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS n FROM projects").first<{ n: number }>())?.n ?? 0;
+    await env.DB.prepare(insertSql).bind(id, slug, p.title, p.year, p.category, p.short_description, p.full_description,
+      JSON.stringify(p.technologies), p.github_url, p.live_url, p.video_url, p.cover_key, JSON.stringify(p.gallery), p.status, pos, now, now).run();
+    return json({ project: adminProject((await get(env, id))!) }, 201);
+  }
+  if (path === "/projects/order" && method === "PUT") {
+    const body = await readJson(req);
+    const ids = body.ids;
+    const rows = await env.DB.prepare("SELECT id FROM projects").all<{ id: string }>();
+    const existing = new Set(rows.results.map((r) => r.id));
+    if (!Array.isArray(ids) || ids.length !== existing.size || new Set(ids).size !== ids.length || !ids.every((i) => typeof i === "string" && existing.has(i)))
+      throw new HttpError(400, "Order must list every project exactly once");
+    await env.DB.batch((ids as string[]).map((id, i) => env.DB.prepare("UPDATE projects SET position = ? WHERE id = ?").bind(i, id)));
+    return json({ ok: true });
+  }
+
+  const m = path.match(/^\/projects\/([0-9a-f-]{36})(\/duplicate)?$/);
+  if (m) {
+    const id = m[1];
+    const row = await get(env, id);
+    if (!row) throw new HttpError(404, "Project not found");
+    if (m[2] && method === "POST") {
+      const newId = crypto.randomUUID(), now = Date.now();
+      const title = `${row.title.slice(0, 90)} (copy)`;
+      const slug = await uniqueSlug(env, title);
+      await env.DB.batch([
+        env.DB.prepare("UPDATE projects SET position = position + 1 WHERE position > ?").bind(row.position),
+        env.DB.prepare(insertSql).bind(newId, slug, title, row.year, row.category, row.short_description, row.full_description,
+          row.technologies, row.github_url, row.live_url, row.video_url, row.cover_key, row.gallery, "draft", row.position + 1, now, now),
+      ]);
+      return json({ project: adminProject((await get(env, newId))!) }, 201);
+    }
+    if (!m[2] && method === "PUT") {
+      const p = projectInput(await readJson(req));
+      await env.DB.prepare(`UPDATE projects SET title=?, year=?, category=?, short_description=?, full_description=?, technologies=?,
+        github_url=?, live_url=?, video_url=?, cover_key=?, gallery=?, status=?, updated_at=? WHERE id=?`)
+        .bind(p.title, p.year, p.category, p.short_description, p.full_description, JSON.stringify(p.technologies),
+          p.github_url, p.live_url, p.video_url, p.cover_key, JSON.stringify(p.gallery), p.status, Date.now(), id).run();
+      return json({ project: adminProject((await get(env, id))!) });
+    }
+    if (!m[2] && method === "PATCH") {
+      const body = await readJson(req, 1000);
+      if (body.status !== "draft" && body.status !== "published") throw new HttpError(400, "Invalid status");
+      await env.DB.prepare("UPDATE projects SET status = ?, updated_at = ? WHERE id = ?").bind(body.status, Date.now(), id).run();
+      return json({ project: adminProject((await get(env, id))!) });
+    }
+    if (!m[2] && method === "DELETE") {
+      await env.DB.prepare("DELETE FROM projects WHERE id = ?").bind(id).run();
+      return json({ ok: true });
+    }
+  }
+
+  if (path === "/settings" && method === "GET") return json({ settings: await loadSettings(env) });
+  if (path === "/settings" && method === "PUT") {
+    const s = settingsInput(await readJson(req));
+    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('site', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(JSON.stringify(s)).run();
+    return json({ settings: s });
+  }
+
+  if (path === "/media" && method === "GET") {
+    const rows = await env.DB.prepare("SELECT key, mime, size, created_at FROM media ORDER BY created_at DESC LIMIT 500").all();
+    return json({ media: rows.results });
+  }
+  if (path === "/media" && method === "POST") {
+    if (Number(req.headers.get("content-length") ?? 0) > MAX_UPLOAD + 10_000) throw new HttpError(413, "Image must be 5 MB or smaller");
+    const form = await req.formData().catch(() => { throw new HttpError(400, "Expected a multipart upload"); });
+    const file = form.get("file");
+    if (!(file instanceof File)) throw new HttpError(400, "No file provided");
+    if (file.size === 0 || file.size > MAX_UPLOAD) throw new HttpError(413, "Image must be between 1 byte and 5 MB");
+    const data = new Uint8Array(await file.arrayBuffer());
+    const kind = sniff(data.subarray(0, 12));
+    if (!kind) throw new HttpError(415, "Only PNG, JPEG, WebP, GIF and ICO images are allowed");
+    const key = `${crypto.randomUUID()}.${kind.ext}`;
+    await env.MEDIA.put(key, data, { httpMetadata: { contentType: kind.mime } });
+    await env.DB.prepare("INSERT INTO media (key, mime, size, created_at) VALUES (?, ?, ?, ?)").bind(key, kind.mime, data.byteLength, Date.now()).run();
+    return json({ key, mime: kind.mime, size: data.byteLength }, 201);
+  }
+  const md = path.match(/^\/media\/([0-9a-f-]{36}\.(?:png|jpg|webp|gif|ico))$/);
+  if (md && method === "DELETE") {
+    await deleteMedia(env, md[1], new URL(req.url).searchParams.get("force") === "1");
+    return json({ ok: true });
+  }
+  throw new HttpError(404, "Not found");
+}
+
+async function route(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const path = url.pathname;
+  if (path.startsWith("/media/") && (req.method === "GET" || req.method === "HEAD")) return serveMedia(req, env, path.slice(7));
+  if (path === "/api/public" && req.method === "GET") {
+    const rows = await env.DB.prepare("SELECT * FROM projects WHERE status = 'published' ORDER BY position ASC, created_at ASC").all<ProjectRow>();
+    return json({ settings: await loadSettings(env), projects: rows.results.map(publicProject) }, 200, { "cache-control": "no-cache" });
+  }
+  if (path.startsWith("/api/admin/")) return admin(req, env, path.slice("/api/admin".length));
+  if (path.startsWith("/api/")) throw new HttpError(404, "Not found");
+  return env.ASSETS.fetch(req);
+}
+
+export default {
+  async fetch(req, env) {
+    try {
+      return await route(req, env);
+    } catch (e) {
+      if (e instanceof HttpError) return json({ error: e.message }, e.status, e.headers);
+      console.error("Unhandled error", e);
+      return json({ error: "Something went wrong on the server" }, 500);
+    }
+  },
+} satisfies ExportedHandler<Env>;
+
+
+
+========== worker\util.ts ==========
+export interface Env {
+  DB: D1Database;
+  MEDIA: R2Bucket;
+  ASSETS: Fetcher;
+  ADMIN_PASSWORD_HASH: string;
+  SESSION_SECRET: string;
+}
+
+export class HttpError extends Error {
+  constructor(public status: number, message: string, public headers: Record<string, string> = {}) {
+    super(message);
+  }
+}
+
+export function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      ...headers,
+    },
+  });
+}
+
+const enc = new TextEncoder();
+
+export function toB64u(buf: ArrayBuffer | Uint8Array): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export function fromB64u(s: string): Uint8Array {
+  const pad = "=".repeat((4 - (s.length % 4)) % 4);
+  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + pad);
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+export function randomToken(bytes = 32): string {
+  return toB64u(crypto.getRandomValues(new Uint8Array(bytes)));
+}
+
+export async function hmac(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return toB64u(await crypto.subtle.sign("HMAC", key, enc.encode(message)));
+}
+
+export function safeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+export async function readJson(req: Request, maxBytes = 200_000): Promise<Record<string, unknown>> {
+  const len = Number(req.headers.get("content-length") ?? 0);
+  if (len > maxBytes) throw new HttpError(413, "Request body too large");
+  const text = await req.text();
+  if (text.length > maxBytes) throw new HttpError(413, "Request body too large");
+  try {
+    const v = JSON.parse(text);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+  } catch { /* fall through */ }
+  throw new HttpError(400, "Invalid JSON body");
+}
+
+export function slugify(s: string): string {
+  return s.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+}
+
+
+
+========== worker\validate.ts ==========
+import { HttpError } from "./util";
+
+type Obj = Record<string, unknown>;
+const bad = (m: string) => new HttpError(400, m);
+
+export function str(v: unknown, field: string, max: number, required = false): string {
+  if (v == null || v === "") { if (required) throw bad(`${field} is required`); return ""; }
+  if (typeof v !== "string") throw bad(`${field} must be text`);
+  const t = v.trim();
+  if (required && !t) throw bad(`${field} is required`);
+  if (t.length > max) throw bad(`${field} must be at most ${max} characters`);
+  return t;
+}
+
+export function url(v: unknown, field: string): string | null {
+  const s = str(v, field, 500);
+  if (!s) return null;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "https:" && u.protocol !== "http:") throw 0;
+    return u.toString();
+  } catch { throw bad(`${field} must be a valid http(s) URL`); }
+}
+
+export function email(v: unknown, field: string): string | null {
+  const s = str(v, field, 200);
+  if (!s) return null;
+  if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(s)) throw bad(`${field} must be a valid email address`);
+  return s;
+}
+
+const MEDIA_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpg|webp|gif|ico)$/;
+export function mediaKey(v: unknown, field: string): string | null {
+  if (v == null || v === "") return null;
+  if (typeof v !== "string" || !MEDIA_KEY.test(v)) throw bad(`${field} is not a valid media key`);
+  return v;
+}
+
+function bool(v: unknown, d: boolean): boolean { return typeof v === "boolean" ? v : d; }
+
+function links(v: unknown, field: string): { label: string; url: string }[] {
+  if (v == null) return [];
+  if (!Array.isArray(v) || v.length > 8) throw bad(`${field} must be a list of at most 8 links`);
+  return v.map((l, i) => {
+    const o = (l ?? {}) as Obj;
+    return { label: str(o.label, `${field} ${i + 1} label`, 40, true), url: url(o.url, `${field} ${i + 1} URL`) ?? (() => { throw bad(`${field} ${i + 1} URL is required`); })() };
+  });
+}
+
+export function projectInput(b: Obj) {
+  const year = Number(b.year);
+  if (!Number.isInteger(year) || year < 1980 || year > 2100) throw bad("Year must be between 1980 and 2100");
+  const techRaw = b.technologies ?? [];
+  if (!Array.isArray(techRaw) || techRaw.length > 30) throw bad("Technologies must be a list of at most 30 items");
+  const technologies = [...new Set(techRaw.map((t) => str(t, "Technology", 40)).filter(Boolean))];
+  const galleryRaw = b.gallery ?? [];
+  if (!Array.isArray(galleryRaw) || galleryRaw.length > 20) throw bad("Gallery can hold at most 20 images");
+  const status = b.status === "published" ? "published" : b.status === "draft" || b.status == null ? "draft" : (() => { throw bad("Invalid status"); })();
+  return {
+    title: str(b.title, "Title", 100, true),
+    year,
+    category: str(b.category, "Category", 40),
+    short_description: str(b.shortDescription, "Short description", 180),
+    full_description: str(b.fullDescription, "Full description", 8000),
+    technologies,
+    github_url: url(b.githubUrl, "GitHub URL"),
+    live_url: url(b.liveUrl, "Live URL"),
+    video_url: url(b.videoUrl, "Demo video URL"),
+    cover_key: mediaKey(b.coverKey, "Cover image"),
+    gallery: galleryRaw.map((g) => mediaKey(g, "Gallery image")).filter((g): g is string => !!g),
+    status,
+  };
+}
+
+export const DEFAULT_SETTINGS = {
+  displayName: "Project Archive",
+  logoKey: null as string | null,
+  profileName: "",
+  profileBio: "",
+  aboutText: "",
+  githubUrl: null as string | null,
+  portfolioUrl: null as string | null,
+  contactEmail: null as string | null,
+  copyright: "",
+  footerText: "",
+  profileLinks: [] as { label: string; url: string }[],
+  footerLinks: [] as { label: string; url: string }[],
+  browserTitle: "Project Archive",
+  faviconKey: null as string | null,
+  clouds: true,
+  birds: true,
+  intensity: 2,
+  timeSky: true,
+  easterEggs: true,
+};
+export type Settings = typeof DEFAULT_SETTINGS;
+
+export function settingsInput(b: Obj): Settings {
+  const d = DEFAULT_SETTINGS;
+  const intensity = Number(b.intensity ?? d.intensity);
+  if (![1, 2, 3].includes(intensity)) throw bad("Intensity must be 1, 2 or 3");
+  return {
+    displayName: str(b.displayName, "Display name", 60, true),
+    logoKey: mediaKey(b.logoKey, "Logo"),
+    profileName: str(b.profileName, "Profile name", 60),
+    profileBio: str(b.profileBio, "Profile bio", 300),
+    aboutText: str(b.aboutText, "About", 3000),
+    githubUrl: url(b.githubUrl, "GitHub URL"),
+    portfolioUrl: url(b.portfolioUrl, "Portfolio URL"),
+    contactEmail: email(b.contactEmail, "Contact email"),
+    copyright: str(b.copyright, "Copyright", 120),
+    footerText: str(b.footerText, "Footer text", 300),
+    profileLinks: links(b.profileLinks, "Profile links"),
+    footerLinks: links(b.footerLinks, "Footer links"),
+    browserTitle: str(b.browserTitle, "Browser title", 80, true),
+    faviconKey: mediaKey(b.faviconKey, "Favicon"),
+    clouds: bool(b.clouds, d.clouds),
+    birds: bool(b.birds, d.birds),
+    intensity,
+    timeSky: bool(b.timeSky, d.timeSky),
+    easterEggs: bool(b.easterEggs, d.easterEggs),
+  };
+}
+
+
+
+========== wrangler.jsonc ==========
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "project-archive",
+	"main": "worker/index.ts",
+	"compatibility_date": "2025-09-01",
+	"assets": {
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/api/*",
+			"/media/*"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "project-archive-db",
+			"database_id": "a6340a95-4043-4d53-aa4c-0b472d536763",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "MEDIA",
+			"bucket_name": "project-archive-media"
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
+}
+
+
+========== src\api.ts ==========
+import type { AdminProject, MediaItem, Project, SiteSettings } from "./types";
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+
+let csrf = "";
+export const setCsrf = (t: string) => { csrf = t; };
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {};
+  let payload: BodyInit | undefined;
+  if (body instanceof FormData) payload = body;
+  else if (body !== undefined) { headers["content-type"] = "application/json"; payload = JSON.stringify(body); }
+  if (method !== "GET") headers["x-csrf-token"] = csrf;
+  let res: Response;
+  try {
+    res = await fetch(path, { method, headers, body: payload, credentials: "same-origin" });
+  } catch {
+    throw new ApiError(0, "Can't reach the server");
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, (data as { error?: string }).error ?? `Request failed (${res.status})`);
+  return data as T;
+}
+
+export const publicApi = {
+  load: () => request<{ settings: SiteSettings; projects: Project[] }>("GET", "/api/public"),
+};
+
+const A = "/api/admin";
+export const adminApi = {
+  session: () => request<{ csrf: string }>("GET", `${A}/session`),
+  login: (password: string) => request<{ csrf: string }>("POST", `${A}/login`, { password }),
+  logout: () => request<{ ok: true }>("POST", `${A}/logout`),
+  projects: () => request<{ projects: AdminProject[] }>("GET", `${A}/projects`),
+  create: (p: unknown) => request<{ project: AdminProject }>("POST", `${A}/projects`, p),
+  update: (id: string, p: unknown) => request<{ project: AdminProject }>("PUT", `${A}/projects/${id}`, p),
+  setStatus: (id: string, status: "draft" | "published") => request<{ project: AdminProject }>("PATCH", `${A}/projects/${id}`, { status }),
+  remove: (id: string) => request<{ ok: true }>("DELETE", `${A}/projects/${id}`),
+  duplicate: (id: string) => request<{ project: AdminProject }>("POST", `${A}/projects/${id}/duplicate`),
+  reorder: (ids: string[]) => request<{ ok: true }>("PUT", `${A}/projects/order`, { ids }),
+  settings: () => request<{ settings: SiteSettings }>("GET", `${A}/settings`),
+  saveSettings: (s: SiteSettings) => request<{ settings: SiteSettings }>("PUT", `${A}/settings`, s),
+  media: () => request<{ media: MediaItem[] }>("GET", `${A}/media`),
+  upload: (file: File) => { const f = new FormData(); f.append("file", file); return request<{ key: string }>("POST", `${A}/media`, f); },
+  deleteMedia: (key: string, force = false) => request<{ ok: true }>("DELETE", `${A}/media/${key}${force ? "?force=1" : ""}`),
+};
+
+
+
+========== src\types.ts ==========
+export interface Link { label: string; url: string }
+
+export interface SiteSettings {
+  displayName: string;
+  logoKey: string | null;
+  profileName: string;
+  profileBio: string;
+  aboutText: string;
+  githubUrl: string | null;
+  portfolioUrl: string | null;
+  contactEmail: string | null;
+  copyright: string;
+  footerText: string;
+  profileLinks: Link[];
+  footerLinks: Link[];
+  browserTitle: string;
+  faviconKey: string | null;
+  clouds: boolean;
+  birds: boolean;
+  intensity: number;
+  timeSky: boolean;
+  easterEggs: boolean;
+}
+
+export interface Project {
+  id: string;
+  slug: string;
+  title: string;
+  year: number;
+  category: string;
+  shortDescription: string;
+  fullDescription: string;
+  technologies: string[];
+  githubUrl: string | null;
+  liveUrl: string | null;
+  videoUrl: string | null;
+  coverKey: string | null;
+  gallery: string[];
+}
+
+export interface AdminProject extends Project {
+  status: "draft" | "published";
+  position: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MediaItem { key: string; mime: string; size: number; created_at: number }
+
+export const mediaUrl = (key?: string | null) => (key ? `/media/${key}` : undefined);
+
+
+
+========== src\Viewer.tsx ==========
+import { useCallback, useEffect, useRef, useState } from "react";
+import { publicApi, ApiError } from "./api";
+import { navigate, usePath } from "./router";
+import Sky from "./sky/Sky";
+import Header from "./components/Header";
+import Footer from "./components/Footer";
+import ProjectCard from "./components/ProjectCard";
+import ProjectDialog from "./components/ProjectDialog";
+import StateScreen from "./components/StateScreen";
+import Modal from "./components/Modal";
+import Toast from "./components/Toast";
+import HandBox from "./components/HandBox";
+import { EmptySkyArt, NotFoundArt, OfflineArt, ServerErrorArt } from "./components/Illustrations";
+import { mediaUrl, type Project, type SiteSettings } from "./types";
+
+export const DEFAULT_SETTINGS: SiteSettings = {
+  displayName: "Project Archive", logoKey: null, profileName: "", profileBio: "", aboutText: "", githubUrl: null, portfolioUrl: null,
+  contactEmail: null, copyright: "", footerText: "", profileLinks: [], footerLinks: [], browserTitle: "Project Archive", faviconKey: null,
+  clouds: true, birds: true, intensity: 2, timeSky: true, easterEggs: true,
+};
+
+type Data = { status: "loading" } | { status: "error"; offline: boolean } | { status: "ready"; settings: SiteSettings; projects: Project[] };
+const KONAMI = ["ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown", "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight", "b", "a"];
+
+
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+
+export function applyHead(settings: SiteSettings, extra?: string) {
+  document.title = extra ? `${extra} Â· ${settings.browserTitle}` : settings.browserTitle;
+  if (settings.faviconKey) {
+    let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.append(link); }
+    link.removeAttribute("type");
+    link.href = mediaUrl(settings.faviconKey)!;
+  }
+}
+
+export default function Viewer() {
+  const [data, setData] = useState<Data>({ status: "loading" });
+  const [about, setAbout] = useState(false);
+  const [online, setOnline] = useState(navigator.onLine);
+  const path = usePath();
+  const gridRef = useRef<HTMLElement>(null);
+
+  const load = useCallback(() => {
+    setData({ status: "loading" });
+    publicApi.load().then((d) => setData({ status: "ready", ...d })).catch((e: unknown) => setData({ status: "error", offline: !navigator.onLine || (e instanceof ApiError && e.status === 0) }));
+  }, []);
+  useEffect(load, [load]);
+  useEffect(() => {
+    const on = () => setOnline(true), off = () => setOnline(false);
+    window.addEventListener("online", on); window.addEventListener("offline", off);
+    return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
+  }, []);
+
+  const settings = data.status === "ready" ? data.settings : DEFAULT_SETTINGS;
+  const projects = data.status === "ready" ? data.projects : [];
+const slug = path.startsWith("/p/") ? safeDecode(path.slice(3).replace(/\/+$/, "")) : null;
+  const known = path === "/" || slug !== null;
+  const current = slug ? projects.find((p) => p.slug === slug) ?? null : null;
+  const dialogOpen = known && slug !== null && data.status === "ready";
+
+  useEffect(() => { if (data.status === "ready") applyHead(settings, current?.title); }, [data, settings, current]);
+
+  const open = (p: Project) => navigate(`/p/${p.slug}`, false, { overlay: true });
+  const close = useCallback(() => { if (history.state?.overlay) history.back(); else navigate("/", true); }, []);
+  const home = () => { if (path !== "/") close(); window.scrollTo({ top: 0, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }); };
+  const random = () => {
+    const pool = projects.filter((p) => p.slug !== slug);
+    if (pool.length) open(pool[Math.floor(Math.random() * pool.length)]);
+  };
+
+  // Hidden keyboard sequence (Konami code).
+  // Hidden keyboard sequences: Konami code, and the typed words "time", "origin", "latest". Double-click empty sky to make a wish.
+  useEffect(() => {
+    if (!settings.easterEggs) return;
+    let buf: string[] = [];
+    const say = (m: string) => window.dispatchEvent(new CustomEvent("archive:toast", { detail: m }));
+    const f = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement)?.closest?.("input, textarea, select, [contenteditable]") || e.ctrlKey || e.metaKey || e.altKey) return;
+      buf = [...buf, e.key.length === 1 ? e.key.toLowerCase() : e.key].slice(-12);
+      const tail = buf.join("");
+      if (buf.slice(-KONAMI.length).join() === KONAMI.join()) {
+        buf = []; window.dispatchEvent(new Event("archive:meteors")); say("Meteor shower unlocked.");
+      } else if (tail.endsWith("time")) {
+        buf = []; window.dispatchEvent(new Event("archive:timelapse")); say("Time machine: one whole day in 20 seconds.");
+      } else if (tail.endsWith("origin") || tail.endsWith("latest")) {
+        const oldest = tail.endsWith("origin");
+        buf = [];
+        const pick = [...projects].sort((a, b) => (oldest ? a.year - b.year : b.year - a.year))[0];
+        if (pick) { open(pick); say(oldest ? `Where it all started: ${pick.year}.` : `The newest thing: ${pick.year}.`); }
+      }
+    };
+    const dbl = (e: MouseEvent) => {
+      if ((e.target as HTMLElement)?.closest?.("a, button, input, textarea, select, [role=dialog], .panel, .scrim, .state, .card")) return;
+      window.dispatchEvent(new Event("archive:wish")); say("Make a wish.");
+    };
+    window.addEventListener("keydown", f);
+    window.addEventListener("dblclick", dbl);
+    return () => { window.removeEventListener("keydown", f); window.removeEventListener("dblclick", dbl); };
+  }, [settings.easterEggs, projects]);
+
+  let body;
+  if (!known) {
+    body = (
+      <StateScreen art={<NotFoundArt />} title="This page flew away" text="There's nothing at this address. The link may be old or mistyped.">
+        <a className="btn primary" href="/" onClick={(e) => { e.preventDefault(); navigate("/"); }}>Back to the archive<HandBox seed="home" /></a>
+      </StateScreen>
+    );
+  } else if (data.status === "loading") {
+    body = <p className="loading" role="status">Loading projectsâ€¦</p>;
+  } else if (data.status === "error") {
+    body = data.offline
+      ? <StateScreen alert art={<OfflineArt />} title="You're offline" text="Reconnect to the internet and the archive will load."><button className="btn primary" onClick={load}>Try again<HandBox seed="r" /></button></StateScreen>
+      : <StateScreen alert art={<ServerErrorArt />} title="The cloud broke" text="Something went wrong on the server. Wait a moment, then try again."><button className="btn primary" onClick={load}>Try again<HandBox seed="r" /></button></StateScreen>;
+  } else if (projects.length === 0) {
+    body = <StateScreen art={<EmptySkyArt />} title="The sky is empty" text="No projects have been published yet. Check back soon." />;
+  } else {
+    body = (
+      <ul className="grid" aria-label="Projects">
+        {projects.map((p, i) => <ProjectCard key={p.id} project={p} index={i} onOpen={open} />)}
+      </ul>
+    );
+  }
+
+  return (
+    <>
+      <Sky clouds={settings.clouds} birds={settings.birds} intensity={settings.intensity} timeSky={settings.timeSky} easterEggs={settings.easterEggs} />
+      <div className="page" inert={dialogOpen || about}>
+        <Header settings={settings} onHome={home} onRandom={projects.length ? random : undefined} onAbout={() => setAbout(true)} />
+        <main id="main" ref={gridRef}>{body}</main>
+        {data.status === "ready" && <Footer settings={settings} />}
+      </div>
+      {dialogOpen && <ProjectDialog key={slug} project={current} onClose={close} />}
+      {about && (
+        <Modal seed="about" onClose={() => setAbout(false)} title={(id) => <header className="dlg-head"><h2 id={id}>About</h2></header>}>
+          <button className="close" onClick={() => setAbout(false)} aria-label="Close" data-autofocus>
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" aria-hidden="true"><path d="M5 6 L19 19 M19 5 L6 18" /></svg>
+          </button>
+          <div className="prose">{settings.aboutText.split(/\n{2,}/).map((p, i) => <p key={i}>{p}</p>)}</div>
+        </Modal>
+      )}
+      {!online && <p className="offline-pill" role="status">You're offline</p>}
+      <Toast />
+    </>
+  );
+}
+
+
+
+========== src\admin\AdminApp.tsx ==========
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { adminApi, ApiError, setCsrf } from "../api";
+import { navigate, toast, usePath } from "../router";
+import Sky from "../sky/Sky";
+import Toast from "../components/Toast";
+import HandBox from "../components/HandBox";
+import StateScreen from "../components/StateScreen";
+import { ForbiddenArt, LogoMark, NotFoundArt, ServerErrorArt } from "../components/Illustrations";
+import { DEFAULT_SETTINGS } from "../Viewer";
+import type { SiteSettings } from "../types";
+import { Ctx } from "./ctx";
+import Dashboard from "./Dashboard";
+import ProjectsList from "./ProjectsList";
+import ProjectEditor from "./ProjectEditor";
+import SiteForm from "./SiteForm";
+import AppearanceForm from "./AppearanceForm";
+import MediaLibrary from "./MediaLibrary";
+import "./admin.css";
+
+type Auth = "checking" | "out" | "in" | "forbidden" | "down";
+const TABS = [["/admin", "Dashboard"], ["/admin/projects", "Projects"], ["/admin/site", "Site"], ["/admin/appearance", "Appearance"], ["/admin/media", "Media"]] as const;
+
+function Login({ onDone, locked }: { onDone: () => void; locked: string | null }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [lock, setLock] = useState(locked);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setErr("");
+    try { const r = await adminApi.login(pw); setCsrf(r.csrf); onDone(); }
+    catch (ex) {
+      if (ex instanceof ApiError && ex.status === 429) setLock(ex.message);
+      else setErr(ex instanceof ApiError && ex.status === 401 ? "That password isn't right." : ex instanceof Error ? ex.message : "Sign-in failed.");
+      setPw("");
+    } finally { setBusy(false); }
+  };
+  if (lock) return (
+    <div className="admin narrow"><StateScreen alert art={<ForbiddenArt />} title="Locked for now" text={`${lock} Wait about 15 minutes before trying again.`} /></div>
+  );
+  return (
+    <div className="admin narrow">
+      <form className="box login" onSubmit={submit}>
+        <HandBox seed="login" fill amp={2} />
+        <LogoMark />
+        <h1>Admin sign-in</h1>
+        <div className="field">
+          <label htmlFor="pw">Password</label>
+          <input id="pw" type="password" autoComplete="current-password" value={pw} onChange={(e) => setPw(e.target.value)} required autoFocus aria-describedby={err ? "pw-err" : undefined} />
+        </div>
+        {err && <p id="pw-err" className="error" role="alert">{err}</p>}
+        <button className="btn primary" disabled={busy || !pw}>{busy ? "Signing inâ€¦" : "Sign in"}<HandBox seed="signin" /></button>
+        <a href="/" className="back" onClick={(e) => { e.preventDefault(); navigate("/"); location.assign("/"); }}>Back to the archive</a>
+      </form>
+    </div>
+  );
+}
+
+export default function AdminApp() {
+  const [auth, setAuth] = useState<Auth>("checking");
+  const [settings, setSettings] = useState<SiteSettings>(DEFAULT_SETTINGS);
+  const [preview, setPreview] = useState<SiteSettings | null>(null);
+  const [lockMsg] = useState<string | null>(null);
+  const path = usePath();
+  const authRef = useRef(auth);
+  authRef.current = auth;
+
+  useEffect(() => {
+    const meta = document.createElement("meta");
+    meta.name = "robots"; meta.content = "noindex";
+    document.head.append(meta);
+    return () => meta.remove();
+  }, []);
+  useEffect(() => { document.title = `Admin Â· ${settings.browserTitle}`; }, [settings.browserTitle]);
+
+  const loadSettings = useCallback(() => adminApi.settings().then((r) => setSettings(r.settings)).catch(() => {}), []);
+  useEffect(() => {
+    adminApi.session().then((r) => { setCsrf(r.csrf); setAuth("in"); }).catch((e) => setAuth(e instanceof ApiError && e.status === 0 ? "down" : "out"));
+  }, []);
+  useEffect(() => { if (auth === "in") loadSettings(); }, [auth, loadSettings]);
+
+  const run = useCallback(async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
+    try { return await fn(); }
+    catch (e) {
+      if (e instanceof ApiError) {
+        if (e.status === 401) { setAuth("out"); toast("Your session ended. Sign in again."); return undefined; }
+        if (e.status === 403) { setAuth("forbidden"); return undefined; }
+        toast(e.message);
+      } else toast("Something went wrong.");
+      return undefined;
+    }
+  }, []);
+
+  const ctx = useMemo(() => ({ run, settings, setSettings, setPreview }), [run, settings]);
+  const sky = preview ?? settings;
+  const logout = async () => { await run(() => adminApi.logout()); setCsrf(""); setAuth("out"); navigate("/admin", true); };
+
+  let body;
+  if (auth === "checking") body = <p className="loading" role="status">Checking your sessionâ€¦</p>;
+  else if (auth === "down") body = <div className="admin narrow"><StateScreen alert art={<ServerErrorArt />} title="Can't reach the server" text="Check your connection and reload the page." /></div>;
+  else if (auth === "forbidden") body = <div className="admin narrow"><StateScreen alert art={<ForbiddenArt />} title="Locked out" text="The server refused that request. Reload the page and sign in again."><button className="btn primary" onClick={() => location.reload()}>Reload<HandBox seed="rl" /></button></StateScreen></div>;
+  else if (auth === "out") body = <Login locked={lockMsg} onDone={() => setAuth("in")} />;
+  else {
+    const p = path.replace(/\/+$/, "") || "/admin";
+    let page;
+    const edit = p.match(/^\/admin\/projects\/([\w-]+)$/);
+    if (p === "/admin") page = <Dashboard />;
+    else if (p === "/admin/projects") page = <ProjectsList />;
+    else if (edit) page = <ProjectEditor key={edit[1]} id={edit[1] === "new" ? null : edit[1]} />;
+    else if (p === "/admin/site") page = <SiteForm />;
+    else if (p === "/admin/appearance") page = <AppearanceForm />;
+    else if (p === "/admin/media") page = <MediaLibrary />;
+    else page = <StateScreen art={<NotFoundArt />} title="No such admin page" text="Use the menu above to find what you need." />;
+    body = (
+      <Ctx.Provider value={ctx}>
+        <div className="admin">
+          <header className="admin-top">
+            <a className="brand" href="/admin" onClick={(e) => { e.preventDefault(); navigate("/admin"); }}><LogoMark /><span>Admin</span></a>
+            <nav aria-label="Admin">
+              {TABS.map(([to, label]) => (
+                <a key={to} href={to} aria-current={(to === "/admin" ? p === to : p.startsWith(to)) ? "page" : undefined} onClick={(e) => { e.preventDefault(); navigate(to); }}>{label}</a>
+              ))}
+            </nav>
+            <div className="row">
+              <a className="btn sm" href="/" target="_blank" rel="noopener">View site<HandBox seed="vs" /></a>
+              <button className="btn sm" onClick={logout}>Sign out<HandBox seed="so" /></button>
+            </div>
+          </header>
+          <main id="main">{page}</main>
+        </div>
+      </Ctx.Provider>
+    );
+  }
+  return (
+    <>
+      <Sky clouds={sky.clouds} birds={sky.birds} intensity={sky.intensity} timeSky={sky.timeSky} easterEggs={sky.easterEggs} />
+      {body}
+      <Toast />
+    </>
+  );
+}
+
+
+
+========== src\admin\MediaField.tsx ==========
+import { useRef, useState } from "react";
+import { adminApi } from "../api";
+import { mediaUrl } from "../types";
+import { useAdmin } from "./ctx";
+
+/** Upload / replace / remove one image. `onChange(newKey, oldKey)` lets the parent delete the old file after saving. */
+export default function MediaField({ label, value, onChange, hint }: { label: string; value: string | null; onChange: (key: string | null, old: string | null) => void; hint?: string }) {
+  const { run } = useAdmin();
+  const input = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const pick = async (file?: File) => {
+    if (!file) return;
+    setBusy(true);
+    const r = await run(() => adminApi.upload(file));
+    setBusy(false);
+    if (r) onChange(r.key, value);
+    if (input.current) input.current.value = "";
+  };
+  return (
+    <div className="field">
+      <span className="label" id={`l-${label}`}>{label}</span>
+      <div className="media-field" role="group" aria-labelledby={`l-${label}`}>
+        <div className="media-preview">{value ? <img src={mediaUrl(value)} alt={`${label} preview`} /> : <span>No image</span>}</div>
+        <div className="row">
+          <button type="button" className="btn sm" disabled={busy} onClick={() => input.current?.click()}>{busy ? "Uploadingâ€¦" : value ? "Replace" : "Upload"}</button>
+          {value && <button type="button" className="btn sm danger" disabled={busy} onClick={() => onChange(null, value)}>Remove</button>}
+        </div>
+        <input ref={input} type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/x-icon" hidden tabIndex={-1} onChange={(e) => pick(e.target.files?.[0])} />
+      </div>
+      {hint && <span className="hint">{hint}</span>}
+    </div>
+  );
+}
+
+export function GalleryField({ value, onChange }: { value: string[]; onChange: (keys: string[], removed?: string) => void }) {
+  const { run } = useAdmin();
+  const input = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const add = async (files: FileList | null) => {
+    if (!files?.length) return;
+    setBusy(true);
+    const keys: string[] = [];
+    for (const f of [...files].slice(0, 20 - value.length)) {
+      const r = await run(() => adminApi.upload(f));
+      if (r) keys.push(r.key);
+    }
+    setBusy(false);
+    if (keys.length) onChange([...value, ...keys]);
+    if (input.current) input.current.value = "";
+  };
+  const move = (i: number, d: number) => { const n = [...value]; [n[i], n[i + d]] = [n[i + d], n[i]]; onChange(n); };
+  return (
+    <div className="field">
+      <span className="label" id="l-gallery">Screenshot gallery</span>
+      <ul className="gallery-list" aria-labelledby="l-gallery">
+        {value.map((k, i) => (
+          <li key={k}>
+            <img src={mediaUrl(k)} alt={`Screenshot ${i + 1}`} />
+            <div className="row">
+              <button type="button" className="btn sm" disabled={i === 0} onClick={() => move(i, -1)} aria-label={`Move screenshot ${i + 1} earlier`}>â†‘</button>
+              <button type="button" className="btn sm" disabled={i === value.length - 1} onClick={() => move(i, 1)} aria-label={`Move screenshot ${i + 1} later`}>â†“</button>
+              <button type="button" className="btn sm danger" onClick={() => onChange(value.filter((x) => x !== k), k)} aria-label={`Remove screenshot ${i + 1}`}>Remove</button>
+            </div>
+          </li>
+        ))}
+      </ul>
+      <div className="row">
+        <button type="button" className="btn sm" disabled={busy || value.length >= 20} onClick={() => input.current?.click()}>{busy ? "Uploadingâ€¦" : "Add screenshots"}</button>
+        <span className="hint">PNG, JPEG, WebP or GIF, up to 5 MB each.</span>
+      </div>
+      <input ref={input} type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif" hidden tabIndex={-1} onChange={(e) => add(e.target.files)} />
+    </div>
+  );
+}
+
+
+
+========== src\admin\MediaLibrary.tsx ==========
+import { useEffect, useRef, useState } from "react";
+import { adminApi, ApiError } from "../api";
+import { toast } from "../router";
+import HandBox from "../components/HandBox";
+import StateScreen from "../components/StateScreen";
+import { EmptySkyArt } from "../components/Illustrations";
+import { mediaUrl, type MediaItem } from "../types";
+import { useAdmin } from "./ctx";
+
+export default function MediaLibrary() {
+  const { run, setSettings } = useAdmin();
+  const [items, setItems] = useState<MediaItem[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const input = useRef<HTMLInputElement>(null);
+  const load = () => run(() => adminApi.media()).then((r) => r && setItems(r.media));
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const upload = async (files: FileList | null) => {
+    if (!files?.length) return;
+    setBusy(true);
+    for (const f of files) await run(() => adminApi.upload(f));
+    setBusy(false);
+    if (input.current) input.current.value = "";
+    load();
+  };
+  const del = async (m: MediaItem) => {
+    try { await adminApi.deleteMedia(m.key); }
+    catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        if (!confirm("This image is used by a project or a site setting. Delete it anyway and remove it from there?")) return;
+        if (!(await run(() => adminApi.deleteMedia(m.key, true)))) return;
+        run(() => adminApi.settings()).then((r) => r && setSettings(r.settings));
+      } else { await run(() => Promise.reject(e)); return; }
+    }
+    toast("Image deleted.");
+    load();
+  };
+  if (!items) return <p className="loading" role="status">Loadingâ€¦</p>;
+  return (
+    <>
+      <div className="page-head">
+        <h1 className="page-title">Media</h1>
+        <button className="btn primary" disabled={busy} onClick={() => input.current?.click()}>{busy ? "Uploadingâ€¦" : "Upload images"}<HandBox seed="up" /></button>
+        <input ref={input} type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,image/x-icon" hidden tabIndex={-1} onChange={(e) => upload(e.target.files)} />
+      </div>
+      {items.length === 0 ? <StateScreen art={<EmptySkyArt />} title="No images yet" text="Uploaded covers, screenshots and logos appear here." /> : (
+        <ul className="media-grid">
+          {items.map((m) => (
+            <li key={m.key} className="box">
+              <HandBox seed={m.key} fill />
+              <img src={mediaUrl(m.key)} alt="" loading="lazy" />
+              <span className="hint">{(m.size / 1024).toFixed(0)} KB</span>
+              <button className="btn sm danger" onClick={() => del(m)} aria-label={`Delete image ${m.key.slice(0, 8)}`}>Delete<HandBox seed={m.key + "d"} /></button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+
+
+========== src\admin\ProjectEditor.tsx ==========
+import { FormEvent, useEffect, useRef, useState } from "react";
+import { adminApi } from "../api";
+import { navigate, toast } from "../router";
+import HandBox from "../components/HandBox";
+import MediaField, { GalleryField } from "./MediaField";
+import { useAdmin } from "./ctx";
+
+interface Form {
+  title: string; year: string; category: string; shortDescription: string; fullDescription: string; technologies: string;
+  githubUrl: string; liveUrl: string; videoUrl: string; coverKey: string | null; gallery: string[]; status: "draft" | "published";
+}
+const blank = (): Form => ({ title: "", year: String(new Date().getFullYear()), category: "", shortDescription: "", fullDescription: "", technologies: "", githubUrl: "", liveUrl: "", videoUrl: "", coverKey: null, gallery: [], status: "draft" });
+
+export default function ProjectEditor({ id }: { id: string | null }) {
+  const { run } = useAdmin();
+  const [form, setForm] = useState<Form | null>(id ? null : blank());
+  const [cats, setCats] = useState<string[]>([]);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const dirty = useRef(false);
+  const trash = useRef<string[]>([]); // replaced/removed images, deleted from storage after a successful save
+
+  useEffect(() => {
+    run(() => adminApi.projects()).then((r) => {
+      if (!r) return;
+      setCats([...new Set(r.projects.map((p) => p.category).filter(Boolean))]);
+      if (!id) return;
+      const p = r.projects.find((x) => x.id === id);
+      if (!p) { toast("That project no longer exists."); navigate("/admin/projects", true); return; }
+      setForm({ title: p.title, year: String(p.year), category: p.category, shortDescription: p.shortDescription, fullDescription: p.fullDescription, technologies: p.technologies.join(", "),
+        githubUrl: p.githubUrl ?? "", liveUrl: p.liveUrl ?? "", videoUrl: p.videoUrl ?? "", coverKey: p.coverKey, gallery: p.gallery, status: p.status });
+    });
+  }, [id, run]);
+  useEffect(() => {
+    const f = (e: BeforeUnloadEvent) => { if (dirty.current) e.preventDefault(); };
+    window.addEventListener("beforeunload", f);
+    return () => window.removeEventListener("beforeunload", f);
+  }, []);
+
+  if (!form) return <p className="loading" role="status">Loadingâ€¦</p>;
+  const set = <K extends keyof Form>(k: K, v: Form[K]) => { dirty.current = true; setForm((f) => f && { ...f, [k]: v }); };
+  const bind = (k: keyof Form) => ({ id: `f-${k}`, value: form[k] as string, onChange: (e: { target: { value: string } }) => set(k, e.target.value as never) });
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true); setErr("");
+    const body = { ...form, year: Number(form.year), technologies: form.technologies.split(",").map((t) => t.trim()).filter(Boolean) };
+    try {
+      const r = await (async () => {
+        const res = id ? await run(() => adminApi.update(id, body)) : await run(() => adminApi.create(body));
+        return res;
+      })();
+      if (r) {
+        dirty.current = false;
+        for (const k of trash.current) await adminApi.deleteMedia(k).catch(() => {}); // refused if another project still uses it
+        toast(form.status === "published" ? "Saved and published." : "Saved as draft.");
+        navigate("/admin/projects");
+      }
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <form className="box editor" onSubmit={submit} noValidate>
+      <HandBox seed="editor" fill amp={2} />
+      <h1 className="page-title">{id ? "Edit project" : "Add project"}</h1>
+      <div className="grid2">
+        <div className="field"><label htmlFor="f-title">Title</label><input {...bind("title")} required maxLength={100} /></div>
+        <div className="field"><label htmlFor="f-year">Year</label><input {...bind("year")} type="number" min={1980} max={2100} required /></div>
+      </div>
+      <div className="field">
+        <label htmlFor="f-category">Category</label>
+        <input {...bind("category")} maxLength={40} list="cats" />
+        <datalist id="cats">{cats.map((c) => <option key={c} value={c} />)}</datalist>
+      </div>
+      <div className="field">
+        <label htmlFor="f-shortDescription">Short description</label>
+        <input {...bind("shortDescription")} maxLength={180} aria-describedby="sd-hint" />
+        <span className="hint" id="sd-hint">Shown on the card. {form.shortDescription.length}/180</span>
+      </div>
+      <div className="field">
+        <label htmlFor="f-fullDescription">Full description</label>
+        <textarea {...bind("fullDescription")} rows={8} maxLength={8000} aria-describedby="fd-hint" />
+        <span className="hint" id="fd-hint">Shown in the project window. Leave a blank line between paragraphs.</span>
+      </div>
+      <div className="field">
+        <label htmlFor="f-technologies">Technologies</label>
+        <input {...bind("technologies")} aria-describedby="t-hint" />
+        <span className="hint" id="t-hint">Separate with commas, e.g. React, Python, Arduino.</span>
+      </div>
+      <div className="grid2">
+        <div className="field"><label htmlFor="f-githubUrl">GitHub URL</label><input {...bind("githubUrl")} type="url" inputMode="url" placeholder="https://github.com/â€¦" /></div>
+        <div className="field"><label htmlFor="f-liveUrl">Live URL</label><input {...bind("liveUrl")} type="url" inputMode="url" placeholder="https://â€¦" /></div>
+      </div>
+      <div className="field"><label htmlFor="f-videoUrl">Demo video URL</label><input {...bind("videoUrl")} type="url" inputMode="url" aria-describedby="v-hint" /><span className="hint" id="v-hint">YouTube, Vimeo, or a direct .mp4 or .webm link.</span></div>
+      <MediaField label="Cover image" value={form.coverKey} onChange={(k, old) => { if (old) trash.current.push(old); set("coverKey", k); }} hint="Shown on the project card. 16:10 works best." />
+      <GalleryField value={form.gallery} onChange={(keys, removed) => { if (removed) trash.current.push(removed); set("gallery", keys); }} />
+      <div className="field">
+        <label htmlFor="f-status">Status</label>
+        <select {...bind("status")}><option value="draft">Draft (hidden from visitors)</option><option value="published">Published</option></select>
+      </div>
+      {err && <p className="error" role="alert">{err}</p>}
+      <div className="row">
+        <button className="btn primary" disabled={busy}>{busy ? "Savingâ€¦" : "Save project"}<HandBox seed="save" /></button>
+        <button type="button" className="btn" onClick={() => { if (!dirty.current || confirm("Discard your changes?")) { dirty.current = false; navigate("/admin/projects"); } }}>Cancel<HandBox seed="cancel" /></button>
+      </div>
+    </form>
+  );
+}
+
+
+
+========== src\admin\SiteForm.tsx ==========
+import { FormEvent, useState } from "react";
+import { adminApi } from "../api";
+import { toast } from "../router";
+import HandBox from "../components/HandBox";
+import type { Link, SiteSettings } from "../types";
+import MediaField from "./MediaField";
+import { useAdmin } from "./ctx";
+
+function LinkList({ label, value, onChange }: { label: string; value: Link[]; onChange: (l: Link[]) => void }) {
+  const upd = (i: number, k: keyof Link, v: string) => onChange(value.map((l, j) => (j === i ? { ...l, [k]: v } : l)));
+  return (
+    <fieldset className="field links-field">
+      <legend>{label}</legend>
+      {value.map((l, i) => (
+        <div className="link-row" key={i}>
+          <input aria-label={`${label} ${i + 1} label`} placeholder="Label" value={l.label} maxLength={40} onChange={(e) => upd(i, "label", e.target.value)} />
+          <input aria-label={`${label} ${i + 1} URL`} placeholder="https://â€¦" type="url" inputMode="url" value={l.url} onChange={(e) => upd(i, "url", e.target.value)} />
+          <button type="button" className="btn sm danger" onClick={() => onChange(value.filter((_, j) => j !== i))} aria-label={`Remove ${label} ${i + 1}`}>Remove</button>
+        </div>
+      ))}
+      {value.length < 8 && <button type="button" className="btn sm" onClick={() => onChange([...value, { label: "", url: "" }])}>Add link<HandBox seed={"al" + label} /></button>}
+    </fieldset>
+  );
+}
+
+export default function SiteForm() {
+  const { run, settings, setSettings } = useAdmin();
+  const [f, setF] = useState<SiteSettings>(settings);
+  const [busy, setBusy] = useState(false);
+  const trash: string[] = [];
+  const set = <K extends keyof SiteSettings>(k: K, v: SiteSettings[K]) => setF((s) => ({ ...s, [k]: v }));
+  const text = (k: "displayName" | "profileName" | "profileBio" | "browserTitle" | "copyright" | "footerText" | "aboutText") => ({ id: `s-${k}`, value: f[k], onChange: (e: { target: { value: string } }) => set(k, e.target.value) });
+  const nullable = (k: "githubUrl" | "portfolioUrl" | "contactEmail") => ({ id: `s-${k}`, value: f[k] ?? "", onChange: (e: { target: { value: string } }) => set(k, e.target.value || null) });
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    const r = await run(() => adminApi.saveSettings(f));
+    setBusy(false);
+    if (r) { setSettings(r.settings); setF(r.settings); for (const k of trash) await adminApi.deleteMedia(k).catch(() => {}); toast("Site settings saved."); }
+  };
+  return (
+    <form className="box editor" onSubmit={submit} noValidate>
+      <HandBox seed="site" fill amp={2} />
+      <h1 className="page-title">Site settings</h1>
+      <MediaField label="Logo" value={f.logoKey} onChange={(k, old) => { if (old) trash.push(old); set("logoKey", k); }} hint="Square images look best. Without one, a small sun-and-cloud mark is used." />
+      <div className="grid2">
+        <div className="field"><label htmlFor="s-displayName">Display name</label><input {...text("displayName")} required maxLength={60} /></div>
+        <div className="field"><label htmlFor="s-browserTitle">Browser title</label><input {...text("browserTitle")} required maxLength={80} /></div>
+      </div>
+      <MediaField label="Favicon" value={f.faviconKey} onChange={(k, old) => { if (old) trash.push(old); set("faviconKey", k); }} hint="A small square PNG or ICO." />
+      <h2>Profile</h2>
+      <div className="field"><label htmlFor="s-profileName">Profile name</label><input {...text("profileName")} maxLength={60} /><span className="hint">Also used as the owner's name in the footer.</span></div>
+      <div className="field"><label htmlFor="s-profileBio">Short bio</label><input {...text("profileBio")} maxLength={300} /></div>
+      <div className="field"><label htmlFor="s-aboutText">About</label><textarea {...text("aboutText")} rows={6} maxLength={3000} /><span className="hint">Opens from the profile menu. Leave empty to hide the About item.</span></div>
+      <div className="grid2">
+        <div className="field"><label htmlFor="s-githubUrl">GitHub URL</label><input {...nullable("githubUrl")} type="url" inputMode="url" /></div>
+        <div className="field"><label htmlFor="s-portfolioUrl">Portfolio URL</label><input {...nullable("portfolioUrl")} type="url" inputMode="url" /></div>
+      </div>
+      <LinkList label="Extra profile links" value={f.profileLinks} onChange={(l) => set("profileLinks", l)} />
+      <h2>Footer</h2>
+      <div className="field"><label htmlFor="s-contactEmail">Contact email</label><input {...nullable("contactEmail")} type="email" /></div>
+      <div className="field"><label htmlFor="s-copyright">Copyright line</label><input {...text("copyright")} maxLength={120} /><span className="hint">Leave empty to use â€œÂ© year, nameâ€.</span></div>
+      <div className="field"><label htmlFor="s-footerText">Footer note</label><input {...text("footerText")} maxLength={300} /></div>
+      <LinkList label="Footer links" value={f.footerLinks} onChange={(l) => set("footerLinks", l)} />
+      <button className="btn primary" disabled={busy}>{busy ? "Savingâ€¦" : "Save settings"}<HandBox seed="ss" /></button>
+    </form>
+  );
+}
+
+
+
+========== src\admin\ProjectsList.tsx ==========
+import { DragEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { adminApi } from "../api";
+import { navigate, toast } from "../router";
+import HandBox from "../components/HandBox";
+import StateScreen from "../components/StateScreen";
+import { EmptySearchArt, EmptySkyArt } from "../components/Illustrations";
+import { mediaUrl, type AdminProject } from "../types";
+import { useAdmin } from "./ctx";
+
+const moveItem = <T,>(list: T[], from: number, to: number): T[] => {
+  const n = [...list];
+  const [x] = n.splice(from, 1);
+  n.splice(Math.max(0, Math.min(n.length, to)), 0, x);
+  return n;
+};
+
+export default function ProjectsList() {
+  const { run } = useAdmin();
+  const [items, setItems] = useState<AdminProject[] | null>(null);
+  const [q, setQ] = useState("");
+  const [grabbed, setGrabbed] = useState<string | null>(null);
+  const [drop, setDrop] = useState<{ id: string; after: boolean } | null>(null);
+  const [live, setLive] = useState("");
+  const dragId = useRef<string | null>(null);
+  const snapshot = useRef<AdminProject[] | null>(null);
+  const handles = useRef<Record<string, HTMLButtonElement | null>>({});
+
+  const load = () => run(() => adminApi.projects()).then((r) => r && setItems(r.projects));
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const filtered = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    if (!items || !t) return items;
+    return items.filter((p) => [p.title, p.category, p.shortDescription, p.technologies.join(" "), String(p.year)].join(" ").toLowerCase().includes(t));
+  }, [items, q]);
+
+  const persist = async (next: AdminProject[]) => {
+    setItems(next);
+    const ok = await run(() => adminApi.reorder(next.map((p) => p.id)));
+    if (!ok) load();
+  };
+  const moveTo = (id: string, pos: number) => {
+    if (!items) return;
+    const from = items.findIndex((p) => p.id === id);
+    const to = Math.max(0, Math.min(items.length - 1, pos));
+    if (from < 0 || from === to) return;
+    persist(moveItem(items, from, to));
+    setLive(`Moved to position ${to + 1} of ${items.length}`);
+  };
+
+  const handleKey = (e: KeyboardEvent<HTMLButtonElement>, p: AdminProject, i: number) => {
+    if (!items) return;
+    if (e.key === " " || e.key === "Enter") {
+      e.preventDefault();
+      if (grabbed === p.id) { setGrabbed(null); persist(items); setLive(`Dropped ${p.title} at position ${i + 1} of ${items.length}`); }
+      else { snapshot.current = items; setGrabbed(p.id); setLive(`Grabbed ${p.title}, position ${i + 1} of ${items.length}. Use arrow keys to move, Space to drop, Escape to cancel.`); }
+    } else if (grabbed === p.id && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      e.preventDefault();
+      const to = i + (e.key === "ArrowUp" ? -1 : 1);
+      if (to < 0 || to >= items.length) return;
+      setItems(moveItem(items, i, to));
+      setLive(`${p.title}, position ${to + 1} of ${items.length}`);
+      requestAnimationFrame(() => handles.current[p.id]?.focus());
+    } else if (grabbed === p.id && e.key === "Escape") {
+      e.preventDefault(); e.stopPropagation();
+      setGrabbed(null); if (snapshot.current) setItems(snapshot.current);
+      setLive("Move cancelled");
+    }
+  };
+
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    if (!items || !dragId.current || !drop) return;
+    const from = items.findIndex((p) => p.id === dragId.current);
+    let to = items.findIndex((p) => p.id === drop.id) + (drop.after ? 1 : 0);
+    if (from < to) to--;
+    dragId.current = null; setDrop(null);
+    if (from !== to && from >= 0) persist(moveItem(items, from, to));
+  };
+
+  const toggle = async (p: AdminProject) => {
+    const next = p.status === "published" ? "draft" : "published";
+    const r = await run(() => adminApi.setStatus(p.id, next));
+    if (r) { setItems((l) => l && l.map((x) => (x.id === p.id ? r.project : x))); toast(next === "published" ? "Published." : "Moved to drafts."); }
+  };
+  const dup = async (p: AdminProject) => {
+    const r = await run(() => adminApi.duplicate(p.id));
+    if (r) { toast("Duplicated as a draft."); load(); }
+  };
+  const del = async (p: AdminProject) => {
+    if (!confirm(`Delete â€œ${p.title}â€? This can't be undone.`)) return;
+    if (await run(() => adminApi.remove(p.id))) { toast("Deleted."); setItems((l) => l && l.filter((x) => x.id !== p.id)); }
+  };
+
+  if (!items || !filtered) return <p className="loading" role="status">Loadingâ€¦</p>;
+  const searching = q.trim() !== "";
+  return (
+    <>
+      <div className="page-head">
+        <h1 className="page-title">Projects</h1>
+        <button className="btn primary" onClick={() => navigate("/admin/projects/new")}>Add project<HandBox seed="add" /></button>
+      </div>
+      {items.length === 0 ? (
+        <StateScreen art={<EmptySkyArt />} title="No projects yet" text="Add your first project to fill the sky."><button className="btn primary" onClick={() => navigate("/admin/projects/new")}>Add project<HandBox seed="add2" /></button></StateScreen>
+      ) : (
+        <>
+          <div className="field search">
+            <label htmlFor="q">Search projects</label>
+            <input id="q" type="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Title, category, technologyâ€¦" />
+          </div>
+          <p className="hint" id="reorder-help">{searching ? "Clear the search to change the order." : "Drag the handle, or focus it and press Space, then use the arrow keys. You can also type a position."}</p>
+          <p className="sr-only" aria-live="assertive">{live}</p>
+          {filtered.length === 0 ? (
+            <StateScreen art={<EmptySearchArt />} title={`Nothing matches â€œ${q.trim()}â€`} text="Check the spelling or try a different word."><button className="btn" onClick={() => setQ("")}>Clear search<HandBox seed="cs" /></button></StateScreen>
+          ) : (
+            <ol className="rows" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
+              {filtered.map((p) => {
+                const i = items.indexOf(p);
+                return (
+                  <li key={p.id} className={`row-item box${grabbed === p.id ? " grabbed" : ""}${drop?.id === p.id ? (drop.after ? " drop-after" : " drop-before") : ""}`}
+                    draggable={!searching} onDragStart={(e) => { dragId.current = p.id; e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", p.id); }}
+                    onDragEnd={() => { dragId.current = null; setDrop(null); }}
+                    onDragOver={(e) => { if (!dragId.current) return; e.preventDefault(); const r = e.currentTarget.getBoundingClientRect(); setDrop({ id: p.id, after: e.clientY > r.top + r.height / 2 }); }}>
+                    <HandBox seed={p.id} fill />
+                    {!searching && (
+                      <button ref={(el) => { handles.current[p.id] = el; }} className="handle" aria-describedby="reorder-help" aria-pressed={grabbed === p.id}
+                        aria-label={`Reorder ${p.title}, position ${i + 1} of ${items.length}`} onKeyDown={(e) => handleKey(e, p, i)} onBlur={() => { if (grabbed === p.id) { setGrabbed(null); persist(items); } }}>
+                        <svg viewBox="0 0 16 24" width="16" height="24" fill="currentColor" aria-hidden="true">{[4, 12, 20].map((y) => <g key={y}><circle cx="4" cy={y} r="2" /><circle cx="12" cy={y} r="2" /></g>)}</svg>
+                      </button>
+                    )}
+                    <div className="row-thumb">{p.coverKey ? <img src={mediaUrl(p.coverKey)} alt="" loading="lazy" /> : <span aria-hidden="true">{p.title.slice(0, 1)}</span>}</div>
+                    <div className="row-main">
+                      <a href={`/admin/projects/${p.id}`} onClick={(e) => { e.preventDefault(); navigate(`/admin/projects/${p.id}`); }}><strong>{p.title}</strong></a>
+                      <span className="hint">{p.year}{p.category ? `, ${p.category}` : ""}</span>
+                    </div>
+                    <span className={`badge ${p.status}`}>{p.status === "published" ? "Published" : "Draft"}</span>
+                    {!searching && (
+                      <label className="pos">
+                        <span className="sr-only">Position of {p.title}</span>
+                        <input type="number" min={1} max={items.length} defaultValue={i + 1} key={`${p.id}-${i}`}
+                          onKeyDown={(e) => { if (e.key === "Enter") moveTo(p.id, Number((e.target as HTMLInputElement).value) - 1); }}
+                          onBlur={(e) => moveTo(p.id, Number(e.target.value) - 1)} />
+                      </label>
+                    )}
+                    <div className="row actions">
+                      <button className="btn sm" onClick={() => navigate(`/admin/projects/${p.id}`)} aria-label={`Edit ${p.title}`}>Edit<HandBox seed={p.id + "e"} /></button>
+                      <button className="btn sm" onClick={() => toggle(p)} aria-label={`${p.status === "published" ? "Unpublish" : "Publish"} ${p.title}`}>{p.status === "published" ? "Unpublish" : "Publish"}<HandBox seed={p.id + "p"} /></button>
+                      <button className="btn sm" onClick={() => dup(p)} aria-label={`Duplicate ${p.title}`}>Duplicate<HandBox seed={p.id + "d"} /></button>
+                      <button className="btn sm danger" onClick={() => del(p)} aria-label={`Delete ${p.title}`}>Delete<HandBox seed={p.id + "x"} /></button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+
+
+========== scripts\import-projects.mjs ==========
+// Bulk-add projects from a JSON file to a running site (local or live).
+// Usage: node scripts/import-projects.mjs projects.json [site-url]
+// Default site is http://localhost:5173. Projects whose title already exists are skipped, so re-running is safe.
+import { readFileSync, existsSync } from "node:fs";
+import { dirname, resolve, extname, basename } from "node:path";
+import readline from "node:readline";
+
+const [file, siteArg] = process.argv.slice(2);
+if (!file) { console.error("Usage: node scripts/import-projects.mjs projects.json [site-url]"); process.exit(1); }
+const site = (siteArg ?? "http://localhost:5173").replace(/\/+$/, "");
+const origin = new URL(site).origin;
+
+function ask(q) {
+  return new Promise((done) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    rl._writeToOutput = (s) => { if (s.includes(q)) process.stdout.write(s); };
+    rl.question(q, (a) => { rl.close(); process.stdout.write("\n"); done(a); });
+  });
+}
+
+const raw = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
+const list = Array.isArray(raw) ? raw : raw.projects;
+if (!Array.isArray(list)) { console.error('The JSON must be a list of projects, or {"projects": [...]}'); process.exit(1); }
+
+const password = process.env.ADMIN_PASSWORD ?? (await ask(`Admin password for ${site}: `));
+let cookie = "", csrf = "";
+async function call(method, path, body) {
+  const headers = { origin, cookie, "x-csrf-token": csrf };
+  if (body && !(body instanceof FormData)) headers["content-type"] = "application/json";
+  const res = await fetch(site + path, { method, headers, body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+  return { data, res };
+}
+
+const login = await call("POST", "/api/admin/login", { password }).catch((e) => { console.error("Sign-in failed:", e.message); process.exit(1); });
+cookie = login.res.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+csrf = login.data.csrf;
+
+const MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" };
+async function upload(rel) {
+  const path = resolve(dirname(file), rel);
+  if (!existsSync(path)) throw new Error(`image not found: ${rel}`);
+  const form = new FormData();
+  form.append("file", new Blob([readFileSync(path)], { type: MIME[extname(path).toLowerCase()] ?? "application/octet-stream" }), basename(path));
+  return (await call("POST", "/api/admin/media", form)).data.key;
+}
+
+const existing = new Set((await call("GET", "/api/admin/projects")).data.projects.map((p) => p.title.toLowerCase()));
+let added = 0, skipped = 0, failed = 0;
+for (const p of list) {
+  const name = p.title ?? "(no title)";
+  if (existing.has(String(p.title).toLowerCase())) { console.log(`skip   ${name} (already exists)`); skipped++; continue; }
+  try {
+    const coverKey = p.cover ? await upload(p.cover) : null;
+    const gallery = [];
+    for (const g of p.gallery ?? []) gallery.push(await upload(g));
+    await call("POST", "/api/admin/projects", {
+      title: p.title, year: p.year, category: p.category, shortDescription: p.shortDescription, fullDescription: p.fullDescription,
+      technologies: p.technologies ?? [], githubUrl: p.githubUrl, liveUrl: p.liveUrl, videoUrl: p.videoUrl, coverKey, gallery,
+      status: p.status ?? "draft",
+    });
+    console.log(`added  ${name}`); added++;
+  } catch (e) { console.log(`FAILED ${name}: ${e.message}`); failed++; }
+}
+console.log(`\nDone: ${added} added, ${skipped} skipped, ${failed} failed. New projects go to the end of the list; reorder them in /admin.`);

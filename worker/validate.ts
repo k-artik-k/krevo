@@ -29,11 +29,17 @@ export function email(v: unknown, field: string): string | null {
   return s;
 }
 
-const MEDIA_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpg|webp|gif|ico)$/;
+const MEDIA_PATH = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}\.(png|jpe?g|webp|gif|ico|svg)$/;
 export function mediaKey(v: unknown, field: string): string | null {
   if (v == null || v === "") return null;
-  if (typeof v !== "string" || !MEDIA_KEY.test(v)) throw bad(`${field} is not a valid media key`);
-  return v;
+  if (typeof v !== "string") throw bad(`${field} must be text`);
+  const s = v.trim();
+  if (!s) return null;
+  if (/^https?:\/\//.test(s)) {
+    try { new URL(s); return s; } catch { throw bad(`${field} must be a valid URL or image filename`); }
+  }
+  if (!MEDIA_PATH.test(s)) throw bad(`${field} must be an image filename (e.g. photo.png) or a full URL`);
+  return s;
 }
 
 function bool(v: unknown, d: boolean): boolean { return typeof v === "boolean" ? v : d; }

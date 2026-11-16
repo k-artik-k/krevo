@@ -47,4 +47,8 @@ export interface AdminProject extends Project {
 
 export interface MediaItem { key: string; mime: string; size: number; created_at: number }
 
-export const mediaUrl = (key?: string | null) => (key ? `/media/${key}` : undefined);
+export const mediaUrl = (key?: string | null) => {
+  if (!key) return undefined;
+  if (key.startsWith("http://") || key.startsWith("https://")) return key;
+  return `/media/${key}`;
+};

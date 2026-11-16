@@ -42,52 +42,6 @@ const insertSql = `INSERT INTO projects (id, slug, title, year, category, short_
   github_url, live_url, video_url, cover_key, gallery, status, position, created_at, updated_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
-// ---------- media ----------
-const MAX_UPLOAD = 5 * 1024 * 1024;
-function sniff(b: Uint8Array): { mime: string; ext: string } | null {
-  const is = (...bytes: number[]) => bytes.every((v, i) => b[i] === v);
-  if (is(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return { mime: "image/png", ext: "png" };
-  if (is(0xff, 0xd8, 0xff)) return { mime: "image/jpeg", ext: "jpg" };
-  if (is(0x47, 0x49, 0x46, 0x38) && (b[4] === 0x37 || b[4] === 0x39) && b[5] === 0x61) return { mime: "image/gif", ext: "gif" };
-  if (is(0x52, 0x49, 0x46, 0x46) && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return { mime: "image/webp", ext: "webp" };
-  if (is(0x00, 0x00, 0x01, 0x00)) return { mime: "image/x-icon", ext: "ico" };
-  return null;
-}
-
-async function serveMedia(req: Request, env: Env, key: string): Promise<Response> {
-  if (!/^[0-9a-f-]{36}\.(png|jpg|webp|gif|ico)$/.test(key)) throw new HttpError(404, "Not found");
-  const headers = {
-    etag: `"${key}"`, "cache-control": "public, max-age=31536000, immutable",
-    "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; sandbox",
-  };
-  if (req.headers.get("if-none-match") === headers.etag) return new Response(null, { status: 304, headers });
-  const obj = await env.MEDIA.get(key);
-  if (!obj) throw new HttpError(404, "Not found");
-  return new Response(obj.body, { headers: { ...headers, "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream" } });
-}
-
-async function mediaInUse(env: Env, key: string, exceptProject?: string): Promise<boolean> {
-  const p = await env.DB.prepare("SELECT 1 FROM projects WHERE (cover_key = ?1 OR gallery LIKE '%' || ?1 || '%') AND id IS NOT ?2 LIMIT 1").bind(key, exceptProject ?? null).first();
-  if (p) return true;
-  const s = await env.DB.prepare("SELECT 1 FROM settings WHERE value LIKE '%' || ? || '%' LIMIT 1").bind(key).first();
-  return !!s;
-}
-
-async function deleteMedia(env: Env, key: string, force: boolean): Promise<void> {
-  if (await mediaInUse(env, key)) {
-    if (!force) throw new HttpError(409, "Image is still used by a project or setting");
-    await env.DB.prepare("UPDATE projects SET cover_key = NULL WHERE cover_key = ?").bind(key).run();
-    const rows = await env.DB.prepare("SELECT id, gallery FROM projects WHERE gallery LIKE '%' || ? || '%'").bind(key).all<{ id: string; gallery: string }>();
-    await env.DB.batch(rows.results.map((r) => env.DB.prepare("UPDATE projects SET gallery = ? WHERE id = ?").bind(JSON.stringify(parseList(r.gallery).filter((k) => k !== key)), r.id)));
-    const s = await loadSettings(env);
-    if (s.logoKey === key) s.logoKey = null;
-    if (s.faviconKey === key) s.faviconKey = null;
-    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('site', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(JSON.stringify(s)).run();
-  }
-  await env.MEDIA.delete(key);
-  await env.DB.prepare("DELETE FROM media WHERE key = ?").bind(key).run();
-}
-
 // ---------- routing ----------
 async function admin(req: Request, env: Env, path: string): Promise<Response> {
   const method = req.method;
@@ -177,36 +131,12 @@ async function admin(req: Request, env: Env, path: string): Promise<Response> {
     return json({ settings: s });
   }
 
-  if (path === "/media" && method === "GET") {
-    const rows = await env.DB.prepare("SELECT key, mime, size, created_at FROM media ORDER BY created_at DESC LIMIT 500").all();
-    return json({ media: rows.results });
-  }
-  if (path === "/media" && method === "POST") {
-    if (Number(req.headers.get("content-length") ?? 0) > MAX_UPLOAD + 10_000) throw new HttpError(413, "Image must be 5 MB or smaller");
-    const form = await req.formData().catch(() => { throw new HttpError(400, "Expected a multipart upload"); });
-    const file = form.get("file");
-    if (!(file instanceof File)) throw new HttpError(400, "No file provided");
-    if (file.size === 0 || file.size > MAX_UPLOAD) throw new HttpError(413, "Image must be between 1 byte and 5 MB");
-    const data = new Uint8Array(await file.arrayBuffer());
-    const kind = sniff(data.subarray(0, 12));
-    if (!kind) throw new HttpError(415, "Only PNG, JPEG, WebP, GIF and ICO images are allowed");
-    const key = `${crypto.randomUUID()}.${kind.ext}`;
-    await env.MEDIA.put(key, data, { httpMetadata: { contentType: kind.mime } });
-    await env.DB.prepare("INSERT INTO media (key, mime, size, created_at) VALUES (?, ?, ?, ?)").bind(key, kind.mime, data.byteLength, Date.now()).run();
-    return json({ key, mime: kind.mime, size: data.byteLength }, 201);
-  }
-  const md = path.match(/^\/media\/([0-9a-f-]{36}\.(?:png|jpg|webp|gif|ico))$/);
-  if (md && method === "DELETE") {
-    await deleteMedia(env, md[1], new URL(req.url).searchParams.get("force") === "1");
-    return json({ ok: true });
-  }
   throw new HttpError(404, "Not found");
 }
 
 async function route(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
-  if (path.startsWith("/media/") && (req.method === "GET" || req.method === "HEAD")) return serveMedia(req, env, path.slice(7));
   if (path === "/api/public" && req.method === "GET") {
     const rows = await env.DB.prepare("SELECT * FROM projects WHERE status = 'published' ORDER BY position ASC, created_at ASC").all<ProjectRow>();
     return json({ settings: await loadSettings(env), projects: rows.results.map(publicProject) }, 200, { "cache-control": "no-cache" });

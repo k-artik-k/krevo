@@ -1,5 +1,4 @@
 import { FormEvent, useState } from "react";
-import { adminApi } from "../api";
 import { toast } from "../router";
 import HandBox from "../components/HandBox";
 import type { Link, SiteSettings } from "../types";
@@ -27,7 +26,6 @@ export default function SiteForm() {
   const { run, settings, setSettings } = useAdmin();
   const [f, setF] = useState<SiteSettings>(settings);
   const [busy, setBusy] = useState(false);
-  const trash: string[] = [];
   const set = <K extends keyof SiteSettings>(k: K, v: SiteSettings[K]) => setF((s) => ({ ...s, [k]: v }));
   const text = (k: "displayName" | "profileName" | "profileBio" | "browserTitle" | "copyright" | "footerText" | "aboutText") => ({ id: `s-${k}`, value: f[k], onChange: (e: { target: { value: string } }) => set(k, e.target.value) });
   const nullable = (k: "githubUrl" | "portfolioUrl" | "contactEmail") => ({ id: `s-${k}`, value: f[k] ?? "", onChange: (e: { target: { value: string } }) => set(k, e.target.value || null) });
@@ -37,18 +35,18 @@ export default function SiteForm() {
     setBusy(true);
     const r = await run(() => adminApi.saveSettings(f));
     setBusy(false);
-    if (r) { setSettings(r.settings); setF(r.settings); for (const k of trash) await adminApi.deleteMedia(k).catch(() => {}); toast("Site settings saved."); }
+    if (r) { setSettings(r.settings); setF(r.settings); toast("Site settings saved."); }
   };
   return (
     <form className="box editor" onSubmit={submit} noValidate>
       <HandBox seed="site" fill amp={2} />
       <h1 className="page-title">Site settings</h1>
-      <MediaField label="Logo" value={f.logoKey} onChange={(k, old) => { if (old) trash.push(old); set("logoKey", k); }} hint="Square images look best. Without one, a small sun-and-cloud mark is used." />
+      <MediaField label="Logo" value={f.logoKey} onChange={(k) => set("logoKey", k)} hint="Square images look best. Without one, a small sun-and-cloud mark is used." />
       <div className="grid2">
         <div className="field"><label htmlFor="s-displayName">Display name</label><input {...text("displayName")} required maxLength={60} /></div>
         <div className="field"><label htmlFor="s-browserTitle">Browser title</label><input {...text("browserTitle")} required maxLength={80} /></div>
       </div>
-      <MediaField label="Favicon" value={f.faviconKey} onChange={(k, old) => { if (old) trash.push(old); set("faviconKey", k); }} hint="A small square PNG or ICO." />
+      <MediaField label="Favicon" value={f.faviconKey} onChange={(k) => set("faviconKey", k)} hint="A small square PNG or ICO." />
       <h2>Profile</h2>
       <div className="field"><label htmlFor="s-profileName">Profile name</label><input {...text("profileName")} maxLength={60} /><span className="hint">Also used as the owner's name in the footer.</span></div>
       <div className="field"><label htmlFor="s-profileBio">Short bio</label><input {...text("profileBio")} maxLength={300} /></div>
