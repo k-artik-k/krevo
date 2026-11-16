@@ -1,0 +1,263 @@
+
+.sky {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--bird-ink, #1d3a5c);
+}
+
+.sky-defs {
+  position: absolute;
+}
+
+.sky-bg {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    180deg,
+    var(--sky-top, #78c1f4) 0%,
+    var(--sky-mid, #a6dcfa) 58%,
+    var(--sky-bot, #dcf2ff) 100%
+  );
+}
+
+.stars {
+  position: absolute;
+  inset: 0;
+  opacity: var(--stars, 0);
+}
+
+.sky.ready .stars {
+  transition: opacity 8s linear;
+}
+
+.star {
+  position: absolute;
+  border-radius: 50%;
+  background: #fff;
+  animation: twinkle 3s ease-in-out infinite alternate;
+}
+
+@keyframes twinkle {
+  from {
+    opacity: .25;
+    transform: scale(.8);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+}
+
+/* Sun and moon */
+
+.orb {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  will-change: transform;
+}
+
+.sky.ready .orb {
+  transition: transform 10s linear, opacity 10s linear;
+}
+
+.halo {
+  position: absolute;
+  width: 130vmax;
+  height: 130vmax;
+  left: -65vmax;
+  top: -65vmax;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    var(--sun-glow, rgba(255,240,180,.4)) 0%,
+    rgba(255,240,180,0) 38%
+  );
+}
+
+.moon-halo {
+  background: radial-gradient(
+    circle,
+    rgba(190,210,255,.28) 0%,
+    rgba(190,210,255,0) 30%
+  );
+}
+
+.sun-art {
+  position: absolute;
+  width: 150px;
+  height: 150px;
+  left: -75px;
+  top: -75px;
+  overflow: visible;
+}
+
+.rays {
+  animation: spin 160s linear infinite;
+  transform-origin: 0 0;
+}
+
+.moon-art {
+  position: absolute;
+  width: 84px;
+  height: 84px;
+  left: -42px;
+  top: -42px;
+  filter: drop-shadow(0 0 14px rgba(220,230,255,.55));
+}
+
+.sun-art,
+.moon-art {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Clouds */
+
+.layer {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
+}
+
+.l0 {
+  opacity: .62;
+}
+
+.l1 {
+  opacity: .9;
+}
+
+.l2 {
+  opacity: 1;
+}
+
+.cloud {
+  position: absolute;
+  left: 0;
+  width: var(--cw, 400px);
+  margin-left: calc(var(--cw, 400px) * -1);
+  will-change: transform;
+}
+
+.cloud svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.cloud-bob {
+  animation: bob var(--bob, 14s) ease-in-out infinite alternate;
+}
+
+@keyframes bob {
+  from {
+    transform: translateY(-6px);
+  }
+
+  to {
+    transform: translateY(8px);
+  }
+}
+
+.cloud.special {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.cloud.special:hover .cloud-bob {
+  animation-duration: 2s;
+}
+
+/* Birds and flying objects */
+
+.birds,
+.fx {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.flock {
+  position: absolute;
+  left: 0;
+  will-change: transform;
+}
+
+.bird {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+/* Shooting stars */
+
+.meteor {
+  position: absolute;
+  width: 130px;
+  height: 2px;
+  border-radius: 2px;
+  transform-origin: right center;
+  background: linear-gradient(
+    90deg,
+    rgba(255,255,255,0),
+    #fff
+  );
+  box-shadow: 0 0 8px rgba(255,255,255,.8);
+}
+
+/* Rainbow */
+
+.rainbow {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: min(900px, 120vw);
+  transform: translateX(-50%);
+  opacity: 0;
+}
+
+.rainbow svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Time machine */
+
+.sky.lapse .orb {
+  transition: transform .15s linear, opacity .4s linear;
+}
+
+.sky.lapse .stars {
+  transition: opacity .4s linear;
+}
+
+/* Reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  .star,
+  .rays,
+  .cloud-bob {
+    animation: none;
+  }
+
+  .sky.ready .orb,
+  .stars {
+    transition: none;
+  }
+}

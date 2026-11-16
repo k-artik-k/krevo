@@ -1,0 +1,16 @@
+[
+  {
+    "title": "Line Follower Robot",
+    "year": 2016,
+    "category": "Hardware",
+    "shortDescription": "My first robot that followed a black line.",
+    "fullDescription": "Longer story here.\n\nSecond paragraph.",
+    "technologies": ["Arduino", "C++"],
+    "githubUrl": "https://github.com/you/robot",
+    "liveUrl": "",
+    "videoUrl": "",
+    "cover": "images/robot.png",
+    "gallery": ["images/robot-2.png", "images/robot-3.png"],
+    "status": "published"
+  }
+]

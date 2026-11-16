@@ -1,0 +1,2 @@
+ADMIN_PASSWORD_HASH="replace_with_generated_hash"
+SESSION_SECRET="replace_with_random_secret"
